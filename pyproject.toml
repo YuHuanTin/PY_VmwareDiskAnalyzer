@@ -1,0 +1,16 @@
+[project]
+name = "vmware-disk-analyzer"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+vmware-disk-analyzer = "main:main"
+
+[tool.uv]
+# 不是可安装的包: src/main.py 由 setup.py 直接执行, 不需要 __init__.py
+package = false
+
+[build-system]
+requires = ["uv_build>=0.13.3,<0.14.0"]
+build-backend = "uv_build"
