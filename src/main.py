@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import argparse
@@ -9,16 +10,11 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 SECTOR = 512
 VMX_SUFFIX = ".vmx"
 DISK_SUFFIXES = (".vmdk", ".vmdk.raw")
-KIND_ORDER = {"D": 0, "M": 1, "S": 2, "C": 3, "I": 4, "X": 5, "N": 6, "B": 7}
-KIND_LEGEND = (
-    "D(isk) 磁盘 · M(em) 内存 · S(tate) 快照状态 · C(heckpoint) 检查点 · "
-    "I(ndex) 快照索引 · X(mx) 配置 · N(vram) 固件变量 · B(oard) 统计"
-)
-KEY_WIDTH = 8  # 基本信息栏的键列宽 (按显示宽度)
 
 # 磁盘节点形如 scsi0:0 / nvme0:0 / ide1:0
 DISK_NODE_RE = re.compile(r"^(?P<node>[A-Za-z_]+\d+:\d+)\.fileName$")
@@ -29,10 +25,20 @@ EXTENT_RE = re.compile(
 FLAT_OFFSET_RE = re.compile(r"offset\s*=\s*(\d+)|^\s*(\d+)")
 # .vmsn 二进制里嵌的文件名
 VMEM_REF_RE = re.compile(rb"[^\x00-\x1f\"'<>\|\*\?]{3,160}\.(vmdk|vmem)")
+# .vmsn 头部的魔数
+VMSN_MAGIC = b"\xd2\xbe\xd2\xbe"
 
 SPARSE_MAGIC = 0x564D444B  # 'KDMV'
 FLAT_MAGIC = 0x20544C46  # 'FLAT'
 STREAM_MAGIC = 0x45524153  # 'SARE'
+
+# 文件类型代码 (D=磁盘 M=内存 S=快照状态 C=检查点 I=快照索引 X=配置 N=固件变量 B=统计)
+KIND_ORDER = {"D": 0, "M": 1, "S": 2, "C": 3, "I": 4, "X": 5, "N": 6, "B": 7}
+KIND_LEGEND = (
+    "D(isk) 磁盘 · M(em) 内存 · S(tate) 快照状态 · C(heckpoint) 检查点 · "
+    "I(ndex) 快照索引 · X(mx) 配置 · N(vram) 固件变量 · B(oard) 统计"
+)
+KEY_WIDTH = 8  # 基本信息栏的键列宽 (按显示宽度)
 
 
 # --------------------------------------------------------------------------
@@ -42,9 +48,7 @@ def humanSize(num: float) -> str:
     """把字节数格式化成 GiB/MiB 形式."""
     for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
         if abs(num) < 1024 or unit == "PiB":
-            if unit == "B":
-                return f"{int(num)} B"
-            return f"{num:.2f} {unit}"
+            return f"{int(num)} B" if unit == "B" else f"{num:.2f} {unit}"
         num /= 1024
     return f"{num:.2f} PiB"
 
@@ -58,7 +62,7 @@ def splitSize(text: str) -> tuple[str, str]:
 
 
 def combinedSize(disk: int, mem: int) -> str:
-    """磁盘 + 内存 合并显示, 单位相同时只写一次: 11.80+12.12GiB."""
+    """磁盘 + 内存 合并显示, 单位相同时只写一次: 11.80 + 12.12GiB."""
     if not disk:
         return humanSize(mem).replace(" ", "")
     if not mem:
@@ -168,7 +172,7 @@ class DirIndex:
         self.files: dict[str, FileEntry] = {}
         self.subdirs: list[str] = []
         self._images: dict[str, DiskImage | None] = {}
-        self._snapshotRefs: tuple[set[str], set[str]] | None = None
+        self._snapshotRefs: VmsnRefs | None = None
         try:
             with os.scandir(directory) as it:
                 for entry in it:
@@ -186,9 +190,6 @@ class DirIndex:
         except OSError:
             pass
 
-    def entry(self, name: str) -> FileEntry | None:
-        return self.files.get(name)
-
     def exists(self, name: str) -> bool:
         return name in self.files
 
@@ -203,9 +204,6 @@ class DirIndex:
     def names(self, suffix: str) -> list[str]:
         return sorted(n for n in self.files if n.lower().endswith(suffix))
 
-    def vmxFiles(self) -> list[str]:
-        return self.names(VMX_SUFFIX)
-
     def totalSize(self) -> int:
         return sum(e.size for e in self.files.values())
 
@@ -216,7 +214,7 @@ class DirIndex:
             self._images[name] = readDiskImage(entry.path, entry.logical) if entry else None
         return self._images[name]
 
-    def snapshotRefs(self) -> tuple[set[str], set[str]]:
+    def snapshotRefs(self) -> VmsnRefs:
         """按需扫描 .vmsn 里引用的磁盘/内存快照名, 结果缓存."""
         if self._snapshotRefs is None:
             self._snapshotRefs = findSnapshotRefs(self)
@@ -259,55 +257,6 @@ class Extent:
     file: str
     offset: int = 0
 
-    @property
-    def byteLength(self) -> int:
-        return self.sectors * SECTOR
-
-
-@dataclass
-class Descriptor:
-    createType: str = ""
-    cid: str = ""
-    parentCID: str = ""
-    parentHint: str | None = None
-    extents: list[Extent] = field(default_factory=list)
-
-
-def parseDescriptorText(text: str) -> Descriptor:
-    """解析 VMDK 描述符文本."""
-    desc = Descriptor()
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line[0] in "#!":
-            continue
-        m = EXTENT_RE.match(line)
-        if m:
-            rest = m.group("rest").strip()
-            offset = 0
-            om = FLAT_OFFSET_RE.search(rest)
-            if om:
-                offset = int(om.group(1) or om.group(2))
-            desc.extents.append(
-                Extent(m.group("access"), int(m.group("sectors")), m.group("type").upper(), m.group("file"), offset)
-            )
-            continue
-        key, sep, value = line.partition("=")
-        if not sep:
-            continue
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
-            value = value[1:-1]
-        if key == "createType":
-            desc.createType = value
-        elif key == "CID":
-            desc.cid = value
-        elif key == "parentCID":
-            desc.parentCID = value
-        elif key == "parentFileNameHint":
-            desc.parentHint = value
-    return desc
-
 
 @dataclass
 class DiskImage:
@@ -327,7 +276,7 @@ class DiskImage:
     def virtualBytes(self) -> int:
         if self.capacitySectors:
             return self.capacitySectors * SECTOR
-        return sum(e.byteLength for e in self.extents)
+        return sum(e.sectors * SECTOR for e in self.extents)
 
     @property
     def provision(self) -> str:
@@ -339,6 +288,46 @@ class DiskImage:
         if "rdm" in ct or "raw" in ct:
             return "裸设备"
         return "未知"
+
+    def extentFiles(self) -> list[str]:
+        """该镜像引用的分片文件名 (不含指向自己的情况)."""
+        return [e.file for e in self.extents if e.kind != "NOACCESS" and e.file != self.path.name]
+
+
+def parseDescriptor(path: Path, text: str) -> DiskImage:
+    """解析 VMDK 描述符文本."""
+    image = DiskImage(path=path, kind="descriptor")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in "#!":
+            continue
+        m = EXTENT_RE.match(line)
+        if m:
+            offset = 0
+            om = FLAT_OFFSET_RE.search(m.group("rest").strip())
+            if om:
+                offset = int(om.group(1) or om.group(2))
+            image.extents.append(
+                Extent(m.group("access"), int(m.group("sectors")), m.group("type").upper(), m.group("file"), offset)
+            )
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+            value = value[1:-1]
+        if key == "createType":
+            image.createType = value
+        elif key == "CID":
+            image.cid = value
+        elif key == "parentCID":
+            image.parentCID = value
+        elif key == "parentFileNameHint":
+            image.parentHint = value
+    image.capacitySectors = sum(e.sectors for e in image.extents)
+    return image
 
 
 def readDiskImage(path: Path, fileSize: int | None = None) -> DiskImage | None:
@@ -357,47 +346,34 @@ def readDiskImage(path: Path, fileSize: int | None = None) -> DiskImage | None:
             text = path.read_bytes().decode("utf-8", errors="replace")
         except OSError:
             return None
-        desc = parseDescriptorText(text)
-        return DiskImage(
-            path=path,
-            kind="descriptor",
-            createType=desc.createType,
-            cid=desc.cid,
-            parentCID=desc.parentCID,
-            parentHint=desc.parentHint,
-            extents=desc.extents,
-            capacitySectors=sum(e.sectors for e in desc.extents),
-            monolithic=False,
-        )
+        return parseDescriptor(path, text)
 
     # 2) 单体稀疏盘 (KDMV)
     #    头部: magic(4) version(4) flags(4) capacity(8) grain(8)
     #          descOffset(8) descSize(8) numGTEsPerGT(4) rgd(8) gd(8) overhead(8)
     if len(head) >= 44 and struct.unpack_from("<I", head, 0)[0] == SPARSE_MAGIC:
-        _magic, _version, _flags, capacity, _grainSize, descOffset, descSize = struct.unpack_from("<IIIQQQQ", head, 0)
-        desc = Descriptor(createType="monolithicSparse")
-        start = descOffset * SECTOR
+        _m, _v, _f, capacity, _g, descOffset, descSize = struct.unpack_from("<IIIQQQQ", head, 0)
+        image = DiskImage(
+            path=path,
+            kind="monolithic-sparse",
+            createType="monolithicSparse",
+            capacitySectors=capacity,
+            monolithic=True,
+        )
         length = descSize * SECTOR
         if length and (fileSize is None or length <= fileSize):
             try:
                 with path.open("rb") as f:
-                    f.seek(start)
-                    desc = parseDescriptorText(decodeText(f.read(length)))
+                    f.seek(descOffset * SECTOR)
+                    embedded = parseDescriptor(path, decodeText(f.read(length)))
+                image.createType = embedded.createType or image.createType
+                image.cid, image.parentCID, image.parentHint = embedded.cid, embedded.parentCID, embedded.parentHint
+                image.extents = embedded.extents
             except OSError:
                 pass
-        if not desc.extents:
-            desc.extents = [Extent("RW", capacity, "SPARSE", path.name)]
-        return DiskImage(
-            path=path,
-            kind="monolithic-sparse",
-            createType=desc.createType or "monolithicSparse",
-            cid=desc.cid,
-            parentCID=desc.parentCID,
-            parentHint=desc.parentHint,
-            extents=desc.extents,
-            capacitySectors=capacity,
-            monolithic=True,
-        )
+        if not image.extents:
+            image.extents = [Extent("RW", capacity, "SPARSE", path.name)]
+        return image
 
     # 3) 单体平面盘 (FLAT) / 流式优化盘 (SARE)
     if len(head) >= 12 and struct.unpack_from("<I", head, 0)[0] in (FLAT_MAGIC, STREAM_MAGIC):
@@ -415,7 +391,7 @@ def readDiskImage(path: Path, fileSize: int | None = None) -> DiskImage | None:
 
 
 # --------------------------------------------------------------------------
-# 快照链
+# 磁盘链
 # --------------------------------------------------------------------------
 @dataclass
 class ChainLink:
@@ -428,15 +404,7 @@ def imageBytes(index: DirIndex, image: DiskImage) -> int:
     """该镜像自身 (不含父盘) 占用的磁盘字节数."""
     if image.monolithic:
         return index.size(image.path.name)
-    total = 0
-    for ext in image.extents:
-        if ext.kind == "NOACCESS":
-            continue
-        if ext.file == image.path.name:
-            total += index.size(image.path.name)
-            continue
-        total += index.size(ext.file)
-    return total
+    return sum(index.size(name) for name in image.extentFiles())
 
 
 def resolveChain(index: DirIndex, leafName: str) -> list[ChainLink]:
@@ -462,6 +430,131 @@ def resolveChain(index: DirIndex, leafName: str) -> list[ChainLink]:
 
 
 # --------------------------------------------------------------------------
+# 快照
+# --------------------------------------------------------------------------
+@dataclass
+class SnapshotInfo:
+    uid: str
+    name: str
+    parent: str | None
+    diskFile: str
+    vmsn: str
+    mtime: datetime | None
+    size: int = 0
+
+
+@dataclass
+class SnapshotTable:
+    """.vmsd 里的快照树."""
+
+    snapshots: list[SnapshotInfo] = field(default_factory=list)
+    diskFiles: set[str] = field(default_factory=set)
+    currentUid: str | None = None
+
+    def ancestors(self) -> set[str]:
+        """当前快照及其所有祖先的磁盘文件 (开机必需)."""
+        byUid = {s.uid: s for s in self.snapshots}
+        result: set[str] = set()
+        cursor = self.currentUid
+        walked: set[str] = set()
+        while cursor and cursor in byUid and cursor not in walked:
+            walked.add(cursor)
+            snap = byUid[cursor]
+            if snap.diskFile:
+                result.add(snap.diskFile)
+            cursor = snap.parent
+        return result
+
+
+class VmsnRefs(NamedTuple):
+    """.vmsn 里提到的磁盘/内存文件名."""
+
+    disks: set[str]
+    vems: set[str]
+
+
+class MemoryFiles(NamedTuple):
+    """目录里的 .vmem 文件分类."""
+
+    snapshot: list[tuple[str, int, datetime | None]]  # 快照自带的内存状态
+    swap: list[tuple[str, int]]  # 运行中虚拟机的内存分页文件
+    orphans: list[tuple[str, int]]
+
+
+def parseSnapshots(index: DirIndex, vmsdName: str) -> SnapshotTable:
+    """解析 .vmsd 快照表."""
+    entry = index.files.get(vmsdName)
+    table = SnapshotTable()
+    if entry is None:
+        return table
+    cfg = parseConfigFile(entry.path)
+    uids: dict[str, SnapshotInfo] = {}
+    for key, value in cfg.items():
+        m = re.match(r"^snapshot(\d+)\.(.+)$", key)
+        if not m:
+            continue
+        snapIndex, fieldName = m.group(1), m.group(2)
+        if fieldName == "uid":
+            uids[snapIndex] = SnapshotInfo(uid=value, name="", parent=None, diskFile="", vmsn="", mtime=None)
+            continue
+        snap = uids.get(snapIndex)
+        if snap is None:
+            continue
+        if fieldName == "displayName":
+            snap.name = value
+        elif fieldName == "parent":
+            snap.parent = value
+        elif fieldName == "filename":
+            snap.vmsn = value
+        elif fieldName.endswith(".fileName"):
+            snap.diskFile = value
+            table.diskFiles.add(value)
+    table.snapshots = [uids[i] for i in sorted(uids, key=lambda x: int(x))]
+    for snap in table.snapshots:
+        if snap.vmsn:
+            snap.mtime = index.mtime(snap.vmsn)
+    table.currentUid = cfg.get("snapshot.current")
+    return table
+
+
+def findSnapshotRefs(index: DirIndex) -> VmsnRefs:
+    """从 .vmsn 快照状态文件里提取引用的磁盘/内存快照文件名.
+
+    .vmsn 里硬编码了每个快照对应的磁盘, 开机时 VMware 会把它们全部打开,
+    所以这些文件缺失会直接导致虚拟机无法启动.
+    """
+    disks: set[str] = set()
+    vems: set[str] = set()
+    for name in index.names(".vmsn"):
+        entry = index.files.get(name)
+        if entry is None:
+            continue
+        try:
+            raw = entry.path.read_bytes()
+        except OSError:
+            continue
+        for m in VMEM_REF_RE.finditer(raw):
+            text = m.group(0).decode("utf-8", errors="replace")
+            (disks if m.group(1) == b"vmdk" else vems).add(text)
+    return VmsnRefs(disks, vems)
+
+
+def vmsnKind(index: DirIndex, name: str) -> str:
+    """读 .vmsn 头部的类型串: Snapshot / Checkpoint."""
+    entry = index.files.get(name)
+    if entry is None:
+        return "Snapshot"
+    try:
+        with entry.path.open("rb") as f:
+            head = f.read(64)
+    except OSError:
+        return "Snapshot"
+    if len(head) < 16 or head[:4] != VMSN_MAGIC:
+        return "Snapshot"
+    return head[12:].split(b"\x00")[0].decode("utf-8", errors="replace") or "Snapshot"
+
+
+# --------------------------------------------------------------------------
 # 分析结果
 # --------------------------------------------------------------------------
 @dataclass
@@ -478,17 +571,14 @@ class DiskReport:
         return self.chain[0].image.provision if self.chain else "未知"
 
 
-@dataclass
-class SnapshotInfo:
-    uid: str
+class FileRow(NamedTuple):
+    """文件清单里的一行."""
+
+    kind: str
     name: str
-    parent: str | None
-    diskFile: str
-    vmsn: str
-    mtime: datetime | None
-    size: int = 0
-    onChain: bool = False
-    depth: int = 0
+    size: int
+    owner: str
+    frag: str = "-"
 
 
 @dataclass
@@ -500,25 +590,23 @@ class VMReport:
     vcpu: int
     disks: list[DiskReport] = field(default_factory=list)
     snapshots: list[SnapshotInfo] = field(default_factory=list)
-    snapshotNames: dict[str, str] = field(default_factory=dict)
-    fileList: list[tuple[str, str, int, str, str]] = field(default_factory=list)
-    liveVmem: str = ""
-    swapVmemTime: datetime | None = None
-    currentDisk: str = ""
-    currentDiskBytes: int = 0
-    currentDiskTime: datetime | None = None
-    currentUid: str | None = None
+    fileList: list[FileRow] = field(default_factory=list)
     branchDeltas: list[tuple[str, int]] = field(default_factory=list)
     orphans: list[tuple[str, int]] = field(default_factory=list)
-    snapVmems: list[tuple[str, int, datetime | None]] = field(default_factory=list)
-    swapVmems: list[tuple[str, int]] = field(default_factory=list)
     orphanVmems: list[tuple[str, int]] = field(default_factory=list)
     orphanVmsns: list[tuple[str, int]] = field(default_factory=list)
+    memSnapshots: list[tuple[str, int, datetime | None]] = field(default_factory=list)
+    memSwap: list[tuple[str, int]] = field(default_factory=list)
+    memSwapTime: datetime | None = None
     missingFiles: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     vmDirBytes: int = 0
     vmDirVmdkBytes: int = 0
     vmDirVmemBytes: int = 0
+    currentUid: str | None = None
+    currentDisk: str = ""
+    currentDiskBytes: int = 0
+    currentDiskTime: datetime | None = None
 
     @property
     def virtualBytes(self) -> int:
@@ -543,318 +631,234 @@ class VMReport:
         )
 
 
-def parseSnapshots(index: DirIndex, vmsdName: str) -> tuple[list[SnapshotInfo], set[str], str | None]:
-    """解析 .vmsd 快照表, 返回 (快照列表, 快照引用的磁盘文件名, 当前快照 uid)."""
-    entry = index.entry(vmsdName)
-    if entry is None:
-        return [], set(), None
-    cfg = parseConfigFile(entry.path)
-    uids: dict[str, SnapshotInfo] = {}
-    diskFiles: set[str] = set()
-    for key, value in cfg.items():
-        m = re.match(r"^snapshot(\d+)\.(.+)$", key)
-        if not m:
-            continue
-        snapIndex, field = m.group(1), m.group(2)
-        if field == "uid":
-            uids[snapIndex] = SnapshotInfo(uid=value, name="", parent=None, diskFile="", vmsn="", mtime=None)
-            continue
-        snap = uids.get(snapIndex)
-        if snap is None:
-            continue
-        if field == "displayName":
-            snap.name = value
-        elif field == "parent":
-            snap.parent = value
-        elif field == "filename":
-            snap.vmsn = value
-        elif field.endswith(".fileName"):
-            snap.diskFile = value
-            diskFiles.add(value)
-    snapshots = [uids[i] for i in sorted(uids, key=lambda x: int(x))]
-    for snap in snapshots:
-        if snap.vmsn:
-            snap.mtime = index.mtime(snap.vmsn)
-    return snapshots, diskFiles, cfg.get("snapshot.current")
+# --------------------------------------------------------------------------
+# 分析
+# --------------------------------------------------------------------------
+class VMAnalyzer:
+    """分析单台虚拟机: 磁盘 -> 快照 -> 内存 -> 文件清单."""
 
+    def __init__(self, vmxPath: Path, index: DirIndex) -> None:
+        self.vmxPath = vmxPath
+        self.index = index
+        self.cfg = parseConfigFile(vmxPath)
+        self.report = VMReport(
+            vmxPath=vmxPath,
+            name=self.cfg.get("displayName") or vmxPath.stem,
+            guestOS=self.cfg.get("guestOS", ""),
+            memMB=int(self.cfg.get("memsize", "0") or 0),
+            vcpu=int(self.cfg.get("numvcpus", "0") or 0),
+        )
+        self.chainFiles: set[str] = set()
+        self.chainImages: list[DiskImage] = []
+        self.snapshots = SnapshotTable()
+        self.ancestorFiles: set[str] = set()
+        self.branchFiles: dict[str, int] = {}
+        self.branchExtents: set[str] = set()
+        self.memory = MemoryFiles([], [], [])
+        self.owners: dict[str, list[str]] = {}
 
-def findSnapshotRefs(index: DirIndex) -> tuple[set[str], set[str]]:
-    """从 .vmsn 快照状态文件里提取引用的磁盘/内存快照文件名.
+    def run(self) -> VMReport:
+        self.analyzeDisks()
+        self.analyzeSnapshots()
+        self.analyzeMemory()
+        self.buildFileList()
+        self.report.vmDirBytes = self.index.totalSize()
+        return self.report
 
-    .vmsn 里硬编码了每个快照对应的磁盘, 开机时 VMware 会把它们全部打开,
-    所以这些文件缺失会直接导致虚拟机无法启动.
-    """
-    disks: set[str] = set()
-    vems: set[str] = set()
-    for name in index.names(".vmsn"):
-        entry = index.entry(name)
-        if entry is None:
-            continue
-        try:
-            raw = entry.path.read_bytes()
-        except OSError:
-            continue
-        for m in VMEM_REF_RE.finditer(raw):
-            if m.group(1) == b"vmdk":
-                disks.add(m.group(0).decode("utf-8", errors="replace"))
+    def addOwner(self, name: str, tag: str) -> None:
+        if name and name != "-" and tag not in self.owners.setdefault(name, []):
+            self.owners[name].append(tag)
+
+    def ownerOf(self, name: str) -> str:
+        return " · ".join(self.owners.get(name, [])) or "无引用"
+
+    def analyzeDisks(self) -> None:
+        """解析 .vmx 里的磁盘节点, 还原磁盘链."""
+        index, report = self.index, self.report
+        for key, value in sorted(self.cfg.items()):
+            m = DISK_NODE_RE.match(key)
+            if not m:
+                continue
+            value = value.strip()
+            if not value or value in ("auto detect", "-1") or not value.lower().endswith(DISK_SUFFIXES):
+                continue
+            diskName = Path(value).name
+            if not index.exists(diskName):
+                report.missingFiles.append(value)
+                report.warnings.append(f"虚拟机引用的磁盘文件不存在: {value}")
+                continue
+            chain = resolveChain(index, diskName)
+            for link in chain:
+                link.bytes = imageBytes(index, link.image)
+                self.chainImages.append(link.image)
+                self.chainFiles.add(link.image.path.name)
+                for extName in link.image.extentFiles():
+                    self.chainFiles.add(extName)
+                    if not index.exists(extName):
+                        report.missingFiles.append(extName)
+            self.chainFiles.add(diskName)
+            missing = next((link.missingParent for link in chain if link.missingParent), None)
+            report.disks.append(
+                DiskReport(
+                    node=m.group("node"),
+                    fileName=value,
+                    chain=chain,
+                    virtualBytes=chain[0].image.virtualBytes if chain else 0,
+                    diskBytes=sum(link.bytes for link in chain),
+                    missingParent=missing,
+                )
+            )
+            if missing is not None:
+                report.warnings.append(f"{value} 的父磁盘缺失: {missing}")
+
+        # 当前磁盘 = 磁盘链的首层 (正在写入的那层)
+        if report.disks and report.disks[0].chain:
+            leaf = report.disks[0].chain[0]
+            report.currentDisk = leaf.image.path.name
+            report.currentDiskBytes = leaf.bytes
+            report.currentDiskTime = index.mtime(report.currentDisk)
+
+    def analyzeSnapshots(self) -> None:
+        """解析快照树, 区分当前链上的快照与分支增量."""
+        index, report = self.index, self.report
+        vmsdName = self.vmxPath.stem + ".vmsd"
+        if not index.exists(vmsdName):
+            found = index.names(".vmsd")
+            vmsdName = found[0] if found else vmsdName
+        if index.exists(vmsdName):
+            self.snapshots = parseSnapshots(index, vmsdName)
+            report.snapshots = self.snapshots.snapshots
+            report.currentUid = self.snapshots.currentUid
+
+        # .vmsn 里引用的磁盘同样属于快照树, 开机时也会被打开
+        refs = index.snapshotRefs()
+        ancestorDisks = self.snapshots.ancestors()
+
+        # 快照分支上的磁盘 (不在当前链, 也不在当前快照的祖先链上)
+        for name in sorted(self.snapshots.diskFiles | refs.disks):
+            if name in self.chainFiles:
+                continue  # 已经在当前链上
+            image = index.image(name)
+            if image is None:
+                if not index.exists(name):
+                    report.missingFiles.append(name)
+                continue
+            extentNames = set(image.extentFiles())
+            if name in ancestorDisks:
+                self.ancestorFiles.add(name)
+                self.ancestorFiles |= extentNames
+                continue
+            self.branchFiles[name] = imageBytes(index, image)
+            self.branchExtents |= extentNames
+            for extName in extentNames:
+                if not index.exists(extName):
+                    report.missingFiles.append(extName)
+
+        # 每个快照的占用
+        for snap in report.snapshots:
+            image = index.image(snap.diskFile) if snap.diskFile else None
+            snap.size = imageBytes(index, image) if image else 0
+
+        # 目录内的 vmdk: 分支增量 / 孤立文件
+        missingStems = {n[:-5] for n in report.missingFiles if n.lower().endswith(".vmdk")}
+        for name in index.names(".vmdk"):
+            size = index.size(name)
+            report.vmDirVmdkBytes += size
+            if name in self.chainFiles or name in self.ancestorFiles or name in self.branchExtents:
+                continue
+            if name in self.branchFiles:
+                report.branchDeltas.append((name, self.branchFiles[name]))
+                continue
+            if any(name.startswith(stem + "-") for stem in missingStems):
+                continue  # 缺失磁盘留下的分片, 属于损坏的快照
+            report.orphans.append((name, size))
+
+    def analyzeMemory(self) -> None:
+        """分类目录里的 .vmem: 快照内存状态 / 运行中的分页文件 / 孤立文件."""
+        index, report = self.index, self.report
+        # 只有当前保留内存状态的快照才有 .vmem, 旧快照的 .vmem 被删是正常的
+        known = {s.vmsn[:-5] + ".vmem" for s in report.snapshots if s.vmsn.endswith(".vmsn")}
+        known |= index.snapshotRefs().vems
+        live = ""
+        for key in ("uuid.bios", "uuid.location"):
+            uuid = normalizeUUID(self.cfg.get(key, ""))
+            if uuid:
+                live = f"{uuid}.vmem"
+                known.add(live)
+                break
+        snapshot, swap, orphans = [], [], []
+        for name in index.names(".vmem"):
+            size = index.size(name)
+            report.vmDirVmemBytes += size
+            if name == live:
+                swap.append((name, size))  # 运行中虚拟机的内存交换文件
+                report.memSwapTime = index.mtime(name)
+            elif name in known:
+                snapshot.append((name, size, index.mtime(name)))  # 快照自带的内存状态
             else:
-                vems.add(m.group(0).decode("utf-8", errors="replace"))
-    return disks, vems
+                orphans.append((name, size))
+        self.memory = MemoryFiles(snapshot, swap, orphans)
+        report.memSnapshots = snapshot
+        report.memSwap = swap
+        report.orphanVmems = orphans
 
+    def buildFileList(self) -> None:
+        """生成扁平的文件清单 (磁盘/内存/状态/配置/统计)."""
+        index, report = self.index, self.report
 
-def vmsnKind(index: DirIndex, name: str) -> str:
-    """读 .vmsn 头部的类型串: Snapshot / Checkpoint."""
-    entry = index.entry(name)
-    if entry is None:
-        return "Snapshot"
-    try:
-        with entry.path.open("rb") as f:
-            head = f.read(64)
-    except OSError:
-        return "Snapshot"
-    if len(head) < 16 or head[:4] != b"\xd2\xbe\xd2\xbe":
-        return "Snapshot"
-    return head[12:].split(b"\x00")[0].decode("utf-8", errors="replace") or "Snapshot"
+        # 归属: 哪个文件属于谁
+        for disk in report.disks:
+            self.addOwner(disk.fileName, "当前磁盘")
+        for snap in report.snapshots:
+            tag = f"快照 [{snap.name or snap.uid}]"
+            self.addOwner(snap.diskFile, tag)
+            if snap.vmsn.endswith(".vmsn"):
+                self.addOwner(snap.vmsn[:-5] + ".vmem", tag)
+            self.addOwner(snap.vmsn, tag)
+        for name, _ in self.memory.swap:
+            self.addOwner(name, "当前运行状态")
+
+        # 分片文件 (extent) 已计入所属磁盘, 不单独列出
+        fragments: set[str] = set()
+        for image in self.chainImages:
+            fragments |= set(image.extentFiles())
+        for name in list(self.branchFiles) + list(self.ancestorFiles):
+            image = index.image(name)
+            if image is not None:
+                fragments |= set(image.extentFiles())
+
+        for name in sorted(index.names(".vmdk")):
+            if name in fragments:
+                continue
+            image = index.image(name)
+            # 磁盘文件的占用 = 描述符本身 + 它的分片
+            size = (imageBytes(index, image) if image else 0) or index.size(name)
+            fragCount = sum(1 for ext in image.extentFiles() if index.exists(ext)) if image else 0
+            report.fileList.append(FileRow("D", name, size, self.ownerOf(name), str(fragCount) if fragCount else "-"))
+        for name, size, _ in self.memory.snapshot:
+            report.fileList.append(FileRow("M", name, size, self.ownerOf(name)))
+        for name, size in self.memory.swap:
+            report.fileList.append(FileRow("M", name, size, self.ownerOf(name)))
+        for name in sorted(index.names(".vmsn")):
+            kind = "C" if vmsnKind(index, name) == "Checkpoint" else "S"
+            report.fileList.append(FileRow(kind, name, index.size(name), self.ownerOf(name)))
+            if name not in self.owners:
+                report.orphanVmsns.append((name, index.size(name)))
+        # 配置文件与固件状态
+        for suffix, kind in ((".vmsd", "I"), (".vmx", "X"), (".vmxf", "X"), (".nvram", "N")):
+            for name in sorted(index.names(suffix)):
+                report.fileList.append(FileRow(kind, name, index.size(name), "当前配置"))
+        # 统计文件 (.scoreboard): vmware-vmx 与 UI 共享实时统计的内存文件
+        statsName = Path(self.cfg.get("vmxstats.filename", "")).name
+        for name in sorted(index.names(".scoreboard")):
+            owner = "当前运行状态" if name == statsName else "无引用"
+            report.fileList.append(FileRow("B", name, index.size(name), owner))
+        report.fileList.sort(key=lambda row: (KIND_ORDER.get(row.kind, 9), row.name))
 
 
 def analyzeVM(vmxPath: Path, index: DirIndex) -> VMReport:
     """分析单台虚拟机的磁盘占用情况."""
-    cfg = parseConfigFile(vmxPath)
-    report = VMReport(
-        vmxPath=vmxPath,
-        name=cfg.get("displayName") or vmxPath.stem,
-        guestOS=cfg.get("guestOS", ""),
-        memMB=int(cfg.get("memsize", "0") or 0),
-        vcpu=int(cfg.get("numvcpus", "0") or 0),
-    )
-
-    # --- 磁盘节点 ---
-    chainFiles: set[str] = set()
-    chainImages: list[DiskImage] = []
-    for key, value in sorted(cfg.items()):
-        m = DISK_NODE_RE.match(key)
-        if not m:
-            continue
-        value = value.strip()
-        if not value or value in ("auto detect", "-1"):
-            continue
-        if not value.lower().endswith(DISK_SUFFIXES):
-            continue
-        diskName = Path(value).name
-        if not index.exists(diskName):
-            report.missingFiles.append(value)
-            report.warnings.append(f"虚拟机引用的磁盘文件不存在: {value}")
-            continue
-        chain = resolveChain(index, diskName)
-        for link in chain:
-            link.bytes = imageBytes(index, link.image)
-        chainFiles.add(diskName)
-        for link in chain:
-            chainImages.append(link.image)
-            chainFiles.add(link.image.path.name)
-            for ext in link.image.extents:
-                if ext.kind != "NOACCESS" and ext.file != link.image.path.name:
-                    chainFiles.add(ext.file)
-                    if not index.exists(ext.file):
-                        report.missingFiles.append(ext.file)
-        virtual = chain[0].image.virtualBytes if chain else 0
-        diskBytes = sum(link.bytes for link in chain)
-        missing = next((link.missingParent for link in chain if link.missingParent), None)
-        report.disks.append(
-            DiskReport(
-                node=m.group("node"),
-                fileName=value,
-                chain=chain,
-                virtualBytes=virtual,
-                diskBytes=diskBytes,
-                missingParent=missing,
-            )
-        )
-        if missing is not None:
-            report.warnings.append(f"{value} 的父磁盘缺失: {missing}")
-
-    # 当前磁盘 = 磁盘链的首层 (正在写入的那层)
-    if report.disks and report.disks[0].chain:
-        leaf = report.disks[0].chain[0]
-        report.currentDisk = leaf.image.path.name
-        report.currentDiskBytes = leaf.bytes
-        report.currentDiskTime = index.mtime(report.currentDisk)
-
-    # --- 快照表 ---
-    vmsdName = vmxPath.stem + ".vmsd"
-    if not index.exists(vmsdName):
-        found = index.names(".vmsd")
-        vmsdName = found[0] if found else vmsdName
-    snapshotDiskFiles: set[str] = set()
-    currentUid: str | None = None
-    if index.exists(vmsdName):
-        report.snapshots, snapshotDiskFiles, currentUid = parseSnapshots(index, vmsdName)
-        report.currentUid = currentUid
-
-    # .vmsn 里引用的磁盘同样属于快照树, 开机时也会被打开
-    vmsnDiskFiles, vmsnVmemFiles = index.snapshotRefs()
-
-    # --- 快照树: 当前快照及其祖先 = 开机必需, 其余才是可删的分支 ---
-    byUid = {s.uid: s for s in report.snapshots}
-    ancestorDisks: set[str] = set()
-    cursor = currentUid
-    walked: set[str] = set()
-    while cursor and cursor in byUid and cursor not in walked:
-        walked.add(cursor)
-        snap = byUid[cursor]
-        if snap.diskFile:
-            ancestorDisks.add(snap.diskFile)
-        cursor = snap.parent
-
-    # --- 快照分支上的磁盘 (不在当前链, 也不在当前快照的祖先链上) ---
-    branchFiles: dict[str, int] = {}
-    branchExtents: set[str] = set()
-    ancestorFiles: set[str] = set()
-    for name in sorted(snapshotDiskFiles | vmsnDiskFiles):
-        if name in chainFiles:
-            continue  # 已经在当前链上
-        image = index.image(name)
-        if image is None:
-            if not index.exists(name):
-                report.missingFiles.append(name)
-            continue
-        extentNames = {ext.file for ext in image.extents if ext.kind != "NOACCESS" and ext.file != name}
-        if name in ancestorDisks:
-            ancestorFiles.add(name)
-            ancestorFiles |= extentNames
-            continue
-        branchFiles[name] = imageBytes(index, image)
-        branchExtents |= extentNames
-        for extName in extentNames:
-            if not index.exists(extName):
-                report.missingFiles.append(extName)
-
-    # --- 每个快照的深度 / 占用 / 是否在当前链上 ---
-    for snap in report.snapshots:
-        snap.onChain = snap.diskFile in chainFiles
-        image = index.image(snap.diskFile) if snap.diskFile else None
-        snap.size = imageBytes(index, image) if image else 0
-        depth = 0
-        cursor = snap.parent
-        seen = set()
-        while cursor and cursor in byUid and cursor not in seen:
-            seen.add(cursor)
-            depth += 1
-            cursor = byUid[cursor].parent
-        snap.depth = depth
-        if snap.diskFile:
-            report.snapshotNames[snap.diskFile] = snap.name or snap.uid
-
-    # --- 目录内的 vmdk 文件 ---
-    missingStems = {n[:-5] for n in report.missingFiles if n.lower().endswith(".vmdk")}
-    branch: list[tuple[str, int]] = []
-    orphans: list[tuple[str, int]] = []
-    for name in index.names(".vmdk"):
-        size = index.size(name)
-        report.vmDirVmdkBytes += size
-        if name in chainFiles or name in ancestorFiles or name in branchExtents:
-            continue
-        if name in branchFiles:
-            branch.append((name, branchFiles[name]))
-            continue
-        if any(name.startswith(stem + "-") for stem in missingStems):
-            continue  # 缺失磁盘留下的分片, 属于损坏的快照
-        orphans.append((name, size))
-    report.branchDeltas = branch
-    report.orphans = orphans
-
-    # --- 内存快照 (.vmem) ---
-    # 只有当前保留内存状态的快照才有 .vmem, 旧快照的 .vmem 被删是正常的
-    knownVmem = {s.vmsn[:-5] + ".vmem" for s in report.snapshots if s.vmsn.endswith(".vmsn")} | vmsnVmemFiles
-    for key in ("uuid.bios", "uuid.location"):
-        uuid = normalizeUUID(cfg.get(key, ""))
-        if uuid:
-            knownVmem.add(f"{uuid}.vmem")
-            report.liveVmem = f"{uuid}.vmem"
-            break
-    for name in index.names(".vmem"):
-        size = index.size(name)
-        report.vmDirVmemBytes += size
-        if name == report.liveVmem:
-            report.swapVmems.append((name, size))  # 运行中虚拟机的内存交换文件
-            report.swapVmemTime = index.mtime(name)
-        elif name in knownVmem:
-            report.snapVmems.append((name, size, index.mtime(name)))  # 快照自带的内存状态
-        else:
-            report.orphanVmems.append((name, size))
-
-    # --- 目录总占用 ---
-    report.vmDirBytes = index.totalSize()
-
-    # --- 文件清单: 所有磁盘文件和内存文件, 扁平列出 ---
-    owners: dict[str, list[str]] = {}
-
-    def addOwner(name: str, tag: str) -> None:
-        if name and name != "-" and tag not in owners.setdefault(name, []):
-            owners[name].append(tag)
-
-    for disk in report.disks:
-        addOwner(disk.fileName, "当前磁盘")
-    for snap in report.snapshots:
-        tag = f"快照 [{snap.name or snap.uid}]"
-        addOwner(snap.diskFile, tag)
-        if snap.vmsn.endswith(".vmsn"):
-            addOwner(snap.vmsn[:-5] + ".vmem", tag)
-        addOwner(snap.vmsn, tag)
-    for name, size in report.swapVmems:
-        addOwner(name, "当前运行状态")
-
-    # 分片文件 (extent) 已计入所属磁盘, 不单独列出
-    fragments: set[str] = set()
-    for image in chainImages:
-        for ext in image.extents:
-            if ext.kind != "NOACCESS" and ext.file != image.path.name:
-                fragments.add(ext.file)
-    for name in list(branchFiles) + list(ancestorFiles):
-        image = index.image(name)
-        if image is None:
-            continue
-        for ext in image.extents:
-            if ext.kind != "NOACCESS" and ext.file != name:
-                fragments.add(ext.file)
-
-    for name in sorted(index.names(".vmdk")):
-        if name in fragments:
-            continue  # 分片文件, 已计入所属磁盘
-        image = index.image(name)
-        # 磁盘文件的占用 = 描述符本身 + 它的分片
-        size = (imageBytes(index, image) if image else 0) or index.size(name)
-        fragCount = 0
-        if image is not None:
-            fragCount = sum(
-                1 for ext in image.extents if ext.kind != "NOACCESS" and ext.file != name and index.exists(ext.file)
-            )
-        report.fileList.append(
-            ("D", name, size, " · ".join(owners.get(name, [])) or "无引用", str(fragCount) if fragCount else "-")
-        )
-    for name, size, _ in report.snapVmems:
-        report.fileList.append(("M", name, size, " · ".join(owners.get(name, [])) or "无引用", "-"))
-    for name, size in report.swapVmems:
-        report.fileList.append(("M", name, size, " · ".join(owners.get(name, [])) or "无引用", "-"))
-    for name in sorted(index.names(".vmsn")):
-        owner = " · ".join(owners.get(name, [])) or "无引用"
-        kind = "C" if vmsnKind(index, name) == "Checkpoint" else "S"
-        report.fileList.append((kind, name, index.size(name), owner, "-"))
-        if name not in owners:
-            report.orphanVmsns.append((name, index.size(name)))
-    # 统计文件 (.scoreboard): vmware-vmx 与 UI 共享实时统计的内存文件
-    statsName = Path(cfg.get("vmxstats.filename", "")).name
-    for name in sorted(index.names(".scoreboard")):
-        if name == statsName:
-            report.fileList.append(("B", name, index.size(name), "当前运行状态", "-"))
-        else:
-            report.fileList.append(("B", name, index.size(name), "无引用", "-"))
-    # 配置文件与固件状态
-    for suffix, kind in ((".vmsd", "I"), (".vmx", "X"), (".vmxf", "X"), (".nvram", "N")):
-        for name in sorted(index.names(suffix)):
-            report.fileList.append((kind, name, index.size(name), "当前配置", "-"))
-    report.fileList.sort(key=lambda f: (KIND_ORDER.get(f[0], 9), f[1]))
-    return report
+    return VMAnalyzer(vmxPath, index).run()
 
 
 def scanDir(root: Path) -> list[VMReport]:
@@ -882,13 +886,13 @@ def scanDir(root: Path) -> list[VMReport]:
     reports: list[VMReport] = []
     for directory in sorted(indexes):
         index = indexes[directory]
-        for name in index.vmxFiles():
+        for name in index.names(VMX_SUFFIX):
             reports.append(analyzeVM((directory / name).resolve(), index))
     return reports
 
 
 # --------------------------------------------------------------------------
-# 输出
+# 渲染
 # --------------------------------------------------------------------------
 @dataclass
 class Section:
@@ -906,7 +910,6 @@ class SnapNode:
     diskSize: int
     memFile: str
     memSize: int
-    state: str
     children: list["SnapNode"] = field(default_factory=list)
 
     @property
@@ -924,11 +927,10 @@ def buildSnapTree(r: VMReport) -> list[SnapNode]:
     """把 .vmsd 的快照树还原出来, 每个节点带磁盘增量和内存状态."""
     nodes: dict[str, SnapNode] = {}
     for snap in r.snapshots:
-        memFile = "-"
-        memSize = 0
+        memFile, memSize = "-", 0
         if snap.vmsn.endswith(".vmsn"):
             want = snap.vmsn[:-5] + ".vmem"
-            for name, size, _ in r.snapVmems:
+            for name, size, _ in r.memSnapshots:
                 if name == want:
                     memFile, memSize = name, size
                     break
@@ -939,7 +941,6 @@ def buildSnapTree(r: VMReport) -> list[SnapNode]:
             diskSize=snap.size,
             memFile=memFile,
             memSize=memSize,
-            state="当前链" if snap.onChain else "分支",
         )
 
     # 按 .vmsd 的父子关系挂接
@@ -952,9 +953,9 @@ def buildSnapTree(r: VMReport) -> list[SnapNode]:
 
     # 当前状态: 内存分页文件只在运行中存在, 关机后仅剩当前磁盘
     memFile, memSize, when = "-", 0, r.currentDiskTime
-    for name, size in r.swapVmems:
+    for name, size in r.memSwap:
         memFile, memSize = name, size
-        when = r.swapVmemTime
+        when = r.memSwapTime
     node = SnapNode(
         label="当前",
         time=when,
@@ -962,7 +963,6 @@ def buildSnapTree(r: VMReport) -> list[SnapNode]:
         diskSize=r.currentDiskBytes,
         memFile=memFile,
         memSize=memSize,
-        state="当前",
     )
     current = nodes.get(r.currentUid or "")
     if current is not None:
@@ -987,12 +987,9 @@ def renderTree(items: list[SnapNode]) -> list[tuple[SnapNode, str]]:
     return result
 
 
-def vmSections(r: VMReport, brief: bool = False) -> list[Section]:
-    """组装一台虚拟机的各个展示区块."""
-    sections: list[Section] = []
-
-    # 基本信息 (均来自 .vmx, 不随快照变化)
-    info = [f"{padTo('配置文件', KEY_WIDTH)} {r.vmxPath.name}"]
+def basicSection(r: VMReport) -> Section:
+    """基本信息 (均来自 .vmx, 不随快照变化)."""
+    lines = [f"{padTo('配置文件', KEY_WIDTH)} {r.vmxPath.name}"]
     detail = []
     if r.guestOS:
         detail.append(r.guestOS)
@@ -1001,51 +998,40 @@ def vmSections(r: VMReport, brief: bool = False) -> list[Section]:
     if r.vcpu:
         detail.append(f"{r.vcpu} vCPU")
     if detail:
-        info.append(f"{padTo('客户机', KEY_WIDTH)} " + " · ".join(detail))
+        lines.append(f"{padTo('客户机', KEY_WIDTH)} " + " · ".join(detail))
     for d in r.disks:
-        info.append(f"{padTo('磁盘', KEY_WIDTH)} {d.node} · {d.provision}")
-        info.append(f"{padTo('容量', KEY_WIDTH)} 虚拟 {humanSize(d.virtualBytes)} · 实际 {humanSize(d.diskBytes)}")
-    sections.append(Section("基本", info))
+        lines.append(f"{padTo('磁盘', KEY_WIDTH)} {d.node} · {d.provision}")
+        lines.append(f"{padTo('容量', KEY_WIDTH)} 虚拟 {humanSize(d.virtualBytes)} · 实际 {humanSize(d.diskBytes)}")
+    return Section("基本", lines)
 
-    if brief:
-        return sections + [Section("文件", usageLines(r))] + problemSection(r)
 
-    # 文件清单 (所有磁盘/内存文件, 扁平列出)
-    fileLines: list[str] = []
+def fileSection(r: VMReport) -> Section:
+    """文件清单 (所有磁盘/内存文件, 扁平列出)."""
+    lines: list[str] = []
     if r.fileList:
-        rows = [[kind, name, frag, humanSize(size), owner] for kind, name, size, owner, frag in r.fileList]
-        fileLines = tableLines(["类型", "文件", "分片", "占用", "归属"], rows, ["<", "<", ">", ">", "<"])
-    fileLines.extend(usageLines(r))
-    sections.append(Section("文件", fileLines))
+        rows = [[row.kind, row.name, row.frag, humanSize(row.size), row.owner] for row in r.fileList]
+        lines = tableLines(["类型", "文件", "分片", "占用", "归属"], rows, ["<", "<", ">", ">", "<"])
+    lines.extend(usageLines(r))
+    return Section("文件", lines)
 
-    # 快照 (每个快照一行: 磁盘增量 + 内存状态)
-    tree = buildSnapTree(r)
-    if tree:
-        rows = []
-        for node, prefix in renderTree(tree):
-            when = node.time.strftime("%Y-%m-%d %H:%M") if node.time else "-"
-            rows.append(
-                [
-                    node.kind,
-                    prefix + f"[{node.label}]",
-                    when,
-                    node.diskFile,
-                    node.memFile,
-                    combinedSize(node.diskSize if node.diskFile != "-" else 0, node.memSize),
-                ]
-            )
-        sections.append(
-            Section(
-                f"快照 ({len(r.snapshots)})",
-                tableLines(
-                    ["类型", "快照", "创建时间", "磁盘", "内存", "占用"],
-                    rows,
-                    ["<", "<", "<", "<", "<", ">"],
-                ),
-            )
+
+def snapshotSection(r: VMReport) -> Section:
+    """快照树 (每个快照一行: 磁盘增量 + 内存状态)."""
+    rows = []
+    for node, prefix in renderTree(buildSnapTree(r)):
+        when = node.time.strftime("%Y-%m-%d %H:%M") if node.time else "-"
+        rows.append(
+            [
+                node.kind,
+                prefix + f"[{node.label}]",
+                when,
+                node.diskFile,
+                node.memFile,
+                combinedSize(node.diskSize if node.diskFile != "-" else 0, node.memSize),
+            ]
         )
-
-    return sections + problemSection(r)
+    headers = ["类型", "快照", "创建时间", "磁盘", "内存", "占用"]
+    return Section(f"快照 ({len(r.snapshots)})", tableLines(headers, rows, ["<", "<", "<", "<", "<", ">"]))
 
 
 def usageLines(r: VMReport) -> list[str]:
@@ -1060,24 +1046,30 @@ def usageLines(r: VMReport) -> list[str]:
 
 
 def problemSection(r: VMReport) -> list[Section]:
+    """问题 (缺失的引用 / 告警 / 残留文件)."""
     problems = []
     for name in sorted(set(r.missingFiles)):
         problems.append(f"缺失的引用文件  {name}  (会导致开机失败)")
     problems.extend(r.warnings)
-    if r.orphans:
-        problems.append(f"无引用的磁盘文件 {len(r.orphans)} 个, 合计 {humanSize(sum(s for _, s in r.orphans))}")
-        problems.extend(f"    {name}  {humanSize(size)}" for name, size in r.orphans[:15])
-        if len(r.orphans) > 15:
-            problems.append(f"    … 其余 {len(r.orphans) - 15} 个")
-    if r.orphanVmems:
-        problems.append(f"无对应的内存快照 {len(r.orphanVmems)} 个, 合计 {humanSize(sum(s for _, s in r.orphanVmems))}")
-        problems.extend(f"    {name}  {humanSize(size)}" for name, size in r.orphanVmems[:15])
-    if r.orphanVmsns:
-        problems.append(
-            f"无对应的快照状态文件 {len(r.orphanVmsns)} 个, 合计 {humanSize(sum(s for _, s in r.orphanVmsns))}"
-        )
-        problems.extend(f"    {name}  {humanSize(size)}" for name, size in r.orphanVmsns[:15])
+    for title, items in (
+        ("无引用的磁盘文件", r.orphans),
+        ("无对应的内存快照", r.orphanVmems),
+        ("无对应的快照状态文件", r.orphanVmsns),
+    ):
+        if items:
+            problems.append(f"{title} {len(items)} 个, 合计 {humanSize(sum(s for _, s in items))}")
+            problems.extend(f"    {name}  {humanSize(size)}" for name, size in items[:15])
     return [Section("问题", problems)] if problems else []
+
+
+def vmSections(r: VMReport, brief: bool = False) -> list[Section]:
+    """组装一台虚拟机的各个展示区块."""
+    sections = [basicSection(r)]
+    if brief:
+        return sections + [Section("文件", usageLines(r))] + problemSection(r)
+    sections.append(fileSection(r))
+    sections.append(snapshotSection(r))
+    return sections + problemSection(r)
 
 
 def renderVM(r: VMReport, width: int, brief: bool = False) -> list[str]:
@@ -1099,10 +1091,9 @@ def render(root: Path, reports: list[VMReport], brief: bool = False) -> str:
     width = max(76, max(dispWidth(line) for secs in blocks for sec in secs for line in sec.lines) + 4)
 
     countText = f"{len(reports)} 台虚拟机"
-    rootText = f" {root}"
     out = [
         "═" * width,
-        padTo(rootText, width),
+        padTo(f" {root}", width),
         padTo(f" {countText}", width),
         f" {padTo('类型', KEY_WIDTH)} {KIND_LEGEND}",
         "═" * width,
@@ -1114,26 +1105,23 @@ def render(root: Path, reports: list[VMReport], brief: bool = False) -> str:
     totalVirtual = sum(r.virtualBytes for r in reports)
     totalChain = sum(r.chainBytes for r in reports)
     totalBranch = sum(r.branchBytes for r in reports)
-    totalOrphan = sum(r.orphanBytes for r in reports)
-    totalDir = sum(r.vmDirBytes for r in reports)
-    totalVmdk = sum(r.vmDirVmdkBytes for r in reports)
     totalVmem = sum(r.vmDirVmemBytes for r in reports)
+    totalVmdk = sum(r.vmDirVmdkBytes for r in reports)
+    totalDir = sum(r.vmDirBytes for r in reports)
+    totalOrphan = sum(r.orphanBytes for r in reports)
 
     out.append("")
     out.append("═" * width)
     out.append(f" 合计  {len(reports)} 台虚拟机 · 虚拟容量 {humanSize(totalVirtual)}")
-    chainParts = [
-        f"当前磁盘链 {humanSize(totalChain)}",
-        f"快照分支增量 {humanSize(totalBranch)}",
-        f"vmem {humanSize(totalVmem)}",
-    ]
-    out.append("       " + " · ".join(chainParts))
-    dirParts = [
-        f"vmdk {humanSize(totalVmdk)}",
-        f"vmem {humanSize(totalVmem)}",
-        f"其它 {humanSize(totalDir - totalVmdk - totalVmem)}",
-    ]
-    out.append(f"       目录实际占用 {humanSize(totalDir)}  ({' · '.join(dirParts)})")
+    out.append(
+        f"       当前磁盘链 {humanSize(totalChain)} · 快照分支增量 {humanSize(totalBranch)}"
+        f" · vmem {humanSize(totalVmem)}"
+    )
+    out.append(
+        f"       目录实际占用 {humanSize(totalDir)}  "
+        f"(vmdk {humanSize(totalVmdk)} · vmem {humanSize(totalVmem)}"
+        f" · 其它 {humanSize(totalDir - totalVmdk - totalVmem)})"
+    )
     out.append(f"       无引用残留 {humanSize(totalOrphan)}")
     out.append("═" * width)
     return "\n".join(out)
